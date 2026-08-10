@@ -1,0 +1,6 @@
+{
+    "uuid": "nettrack@dhruv",
+    "name": "NetTrack",
+    "description": "Customizable real-time network speed meter for GNOME Shell.",
+    "shell-version": ["46"]
+}
