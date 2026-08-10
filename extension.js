@@ -35,6 +35,12 @@ function formatRate(bytesPerSecond) {
 
 export default class NetTrackExtension extends Extension {
     enable() {
+        // Load extension stylesheet.
+        this._theme = St.ThemeContext.get_for_stage(global.stage).get_theme();
+        this._stylesheet = this.dir.get_child('stylesheet.css');
+        this._theme.load_stylesheet(this._stylesheet);
+
+        // Create panel indicator.
         this._indicator = new PanelMenu.Button(
             0.0,
             this.metadata.name,
@@ -43,6 +49,7 @@ export default class NetTrackExtension extends Extension {
 
         this._label = new St.Label({
             text: '↓ --   ↑ --',
+            style_class: 'nettrack-label',
         });
 
         this._indicator.add_child(this._label);
@@ -52,12 +59,15 @@ export default class NetTrackExtension extends Extension {
             this._indicator
         );
 
+        // Initialize throughput state.
         this._previousRxBytes = null;
         this._previousTxBytes = null;
         this._previousTime = null;
 
+        // Get the first sample immediately.
         this._updateNetworkStats();
 
+        // Update every second.
         this._timeoutId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
             UPDATE_INTERVAL_MS,
@@ -69,18 +79,29 @@ export default class NetTrackExtension extends Extension {
     }
 
     disable() {
+        // Remove update timer.
         if (this._timeoutId !== null) {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = null;
         }
 
+        // Remove panel indicator.
         this._indicator?.destroy();
         this._indicator = null;
         this._label = null;
 
+        // Reset throughput state.
         this._previousRxBytes = null;
         this._previousTxBytes = null;
         this._previousTime = null;
+
+        // Unload extension stylesheet.
+        if (this._theme && this._stylesheet) {
+            this._theme.unload_stylesheet(this._stylesheet);
+        }
+
+        this._theme = null;
+        this._stylesheet = null;
     }
 
     _updateNetworkStats() {
@@ -120,7 +141,9 @@ export default class NetTrackExtension extends Extension {
     }
 
     _readCounter(counter, callback) {
-        const path = `/sys/class/net/${INTERFACE}/statistics/${counter}`;
+        const path =
+            `/sys/class/net/${INTERFACE}/statistics/${counter}`;
+
         const file = Gio.File.new_for_path(path);
 
         file.load_contents_async(null, (source, result) => {
@@ -145,7 +168,9 @@ export default class NetTrackExtension extends Extension {
 
                 callback(value);
             } catch (error) {
-                console.error(`NetTrack: ${error.message}`);
+                console.error(
+                    `NetTrack: ${error.message}`
+                );
             }
         });
     }
