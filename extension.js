@@ -6,7 +6,6 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
-const INTERFACE = 'wlp109s0f0';
 const UPDATE_INTERVAL_MS = 1000;
 
 function formatRate(bytesPerSecond) {
@@ -60,6 +59,7 @@ export default class NetTrackExtension extends Extension {
         );
 
         // Initialize throughput state.
+        this._interface = null;
         this._previousRxBytes = null;
         this._previousTxBytes = null;
         this._previousTime = null;
@@ -91,6 +91,7 @@ export default class NetTrackExtension extends Extension {
         this._label = null;
 
         // Reset throughput state.
+        this._interface = null;
         this._previousRxBytes = null;
         this._previousTxBytes = null;
         this._previousTime = null;
@@ -104,33 +105,79 @@ export default class NetTrackExtension extends Extension {
         this._stylesheet = null;
     }
 
+    _getInterface() {
+        try {
+            // This is a synchronous I/O call, but /proc/net/route is a small
+            // virtual file and reading it is very fast.
+            const [ok, contents] = GLib.file_get_contents('/proc/net/route');
+            if (!ok) {
+                // This can happen if the proc file is not available for some reason.
+                return null;
+            }
+
+            const routes = new TextDecoder().decode(contents).trim().split('\n');
+
+            // Skip header line and find the default route.
+            for (let i = 1; i < routes.length; i++) {
+                const fields = routes[i].split(/\s+/);
+                const [iface, destination] = fields;
+
+                // The default route has a destination of 00000000.
+                if (destination === '00000000') {
+                    return iface;
+                }
+            }
+        } catch (e) {
+            console.error(`NetTrack: Error getting default interface: ${e.message}`);
+        }
+
+        return null; // No default route found.
+    }
+
     _updateNetworkStats() {
-        this._readCounter('rx_bytes', rxBytes => {
-            this._readCounter('tx_bytes', txBytes => {
+        const currentInterface = this._getInterface();
+
+        if (currentInterface !== this._interface) {
+            // Interface has changed (or is being detected for the first time).
+            // Reset stats to avoid calculating rates based on old data from a different interface.
+            this._previousRxBytes = null;
+            this._previousTxBytes = null;
+            this._previousTime = null;
+            this._interface = currentInterface;
+        }
+
+        if (!this._interface) {
+            // No active interface found, display placeholder.
+            this._label.set_text('↓ --   ↑ --');
+            return;
+        }
+
+        this._readCounter(this._interface, 'rx_bytes', rxBytes => {
+            if (rxBytes === null) return; // Error was logged in _readCounter
+
+            this._readCounter(this._interface, 'tx_bytes', txBytes => {
+                if (txBytes === null) return; // Error was logged in _readCounter
+
                 const now = GLib.get_monotonic_time();
 
                 if (
                     this._previousRxBytes !== null &&
                     this._previousTxBytes !== null &&
-                    this._previousTime !== null
+                    this._previousTime !== null &&
+                    // Ensure byte counters are not smaller than previous, which can
+                    // happen on interface reset or other system events.
+                    rxBytes >= this._previousRxBytes &&
+                    txBytes >= this._previousTxBytes
                 ) {
                     const elapsedSeconds =
                         (now - this._previousTime) / 1_000_000;
 
-                    const rxRate =
-                        (rxBytes - this._previousRxBytes) /
-                        elapsedSeconds;
+                    if (elapsedSeconds > 0) {
+                        const rxRate = (rxBytes - this._previousRxBytes) / elapsedSeconds;
+                        const txRate = (txBytes - this._previousTxBytes) / elapsedSeconds;
 
-                    const txRate =
-                        (txBytes - this._previousTxBytes) /
-                        elapsedSeconds;
-
-                    const rxText = formatRate(rxRate);
-                    const txText = formatRate(txRate);
-
-                    this._label.set_text(
-                        `↓ ${rxText}   ↑ ${txText}`
-                    );
+                        this._label.set_text(`↓ ${formatRate(rxRate)}   ↑ ${formatRate(txRate)}`);
+                    }
                 }
 
                 this._previousRxBytes = rxBytes;
@@ -140,19 +187,20 @@ export default class NetTrackExtension extends Extension {
         });
     }
 
-    _readCounter(counter, callback) {
-        const path =
-            `/sys/class/net/${INTERFACE}/statistics/${counter}`;
+    _readCounter(interfaceName, counter, callback) {
+        const path = `/sys/class/net/${interfaceName}/statistics/${counter}`;
 
         const file = Gio.File.new_for_path(path);
 
         file.load_contents_async(null, (source, result) => {
             try {
-                const [success, contents] =
-                    source.load_contents_finish(result);
+                const [success, contents] = source.load_contents_finish(result);
 
                 if (!success) {
-                    throw new Error(`Failed to read ${path}`);
+                    // This can happen if the interface goes down. Log as a warning.
+                    console.warn(`NetTrack: Failed to read ${path}`);
+                    callback(null);
+                    return;
                 }
 
                 const text =
@@ -161,16 +209,13 @@ export default class NetTrackExtension extends Extension {
                 const value = Number.parseInt(text, 10);
 
                 if (!Number.isFinite(value)) {
-                    throw new Error(
-                        `Invalid counter value: ${text}`
-                    );
+                    throw new Error(`Invalid counter value: ${text}`);
                 }
 
                 callback(value);
             } catch (error) {
-                console.error(
-                    `NetTrack: ${error.message}`
-                );
+                console.error(`NetTrack: ${error.message}`);
+                callback(null);
             }
         });
     }
