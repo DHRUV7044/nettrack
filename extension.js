@@ -15,6 +15,13 @@ const HIDDEN_INTERFACE_PREFIXES = [
     'virbr',
     'vmnet',
 ];
+const HIDDEN_BLOCK_DEVICE_PREFIXES = [
+    'dm-',
+    'loop',
+    'ram',
+    'zram',
+];
+const DISK_SECTOR_SIZE_BYTES = 512;
 
 function formatRate(bytesPerSecond) {
     const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
@@ -61,13 +68,25 @@ export default class NetTrackExtension extends Extension {
 
         this._indicator.add_child(this._label);
 
-        this._totalItem = this._createInfoMenuItem('Total  ↓ --   ↑ --');
-        this._emptyItem = this._createInfoMenuItem('No network interfaces found');
-        this._interfaceItems = new Map();
+        this._networkSection = new PopupMenu.PopupMenuSection();
+        this._diskSection = new PopupMenu.PopupMenuSection();
+        this._networkTotalItem = this._createInfoMenuItem('Network total  ↓ --   ↑ --');
+        this._networkEmptyItem = this._createInfoMenuItem('No network interfaces found');
+        this._networkItems = new Map();
+        this._diskTotalItem = this._createInfoMenuItem('Disk total  Read --   Write --');
+        this._diskEmptyItem = this._createInfoMenuItem('No disks found');
+        this._diskItems = new Map();
 
-        this._indicator.menu.addMenuItem(this._totalItem);
+        this._indicator.menu.addMenuItem(this._networkSection);
+        this._networkSection.addMenuItem(this._networkTotalItem);
+        this._networkSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._networkSection.addMenuItem(this._networkEmptyItem);
+
         this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._indicator.menu.addMenuItem(this._emptyItem);
+        this._indicator.menu.addMenuItem(this._diskSection);
+        this._diskSection.addMenuItem(this._diskTotalItem);
+        this._diskSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._diskSection.addMenuItem(this._diskEmptyItem);
 
         Main.panel.addToStatusArea(
             this.uuid,
@@ -75,17 +94,18 @@ export default class NetTrackExtension extends Extension {
         );
 
         // Initialize throughput state.
-        this._previousStats = new Map();
+        this._previousNetworkStats = new Map();
+        this._previousDiskStats = new Map();
 
         // Get the first sample immediately.
-        this._updateNetworkStats();
+        this._updateStats();
 
         // Update every second.
         this._timeoutId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
             UPDATE_INTERVAL_MS,
             () => {
-                this._updateNetworkStats();
+                this._updateStats();
                 return GLib.SOURCE_CONTINUE;
             }
         );
@@ -102,12 +122,18 @@ export default class NetTrackExtension extends Extension {
         this._indicator?.destroy();
         this._indicator = null;
         this._label = null;
-        this._totalItem = null;
-        this._emptyItem = null;
-        this._interfaceItems = null;
+        this._networkSection = null;
+        this._diskSection = null;
+        this._networkTotalItem = null;
+        this._networkEmptyItem = null;
+        this._networkItems = null;
+        this._diskTotalItem = null;
+        this._diskEmptyItem = null;
+        this._diskItems = null;
 
         // Reset throughput state.
-        this._previousStats = null;
+        this._previousNetworkStats = null;
+        this._previousDiskStats = null;
 
         // Unload extension stylesheet.
         if (this._theme && this._stylesheet) {
@@ -200,6 +226,11 @@ export default class NetTrackExtension extends Extension {
         );
     }
 
+    _updateStats() {
+        this._updateNetworkStats();
+        this._updateDiskStats();
+    }
+
     _updateNetworkStats() {
         const now = GLib.get_monotonic_time();
         const defaultInterface = this._getDefaultInterface();
@@ -211,8 +242,8 @@ export default class NetTrackExtension extends Extension {
         let hasRate = false;
 
         for (const interfaceName of interfaces) {
-            const rxBytes = this._readCounter(interfaceName, 'rx_bytes');
-            const txBytes = this._readCounter(interfaceName, 'tx_bytes');
+            const rxBytes = this._readNetworkCounter(interfaceName, 'rx_bytes');
+            const txBytes = this._readNetworkCounter(interfaceName, 'tx_bytes');
 
             if (rxBytes === null || txBytes === null) {
                 continue;
@@ -220,7 +251,7 @@ export default class NetTrackExtension extends Extension {
 
             currentInterfaces.add(interfaceName);
 
-            const previous = this._previousStats.get(interfaceName);
+            const previous = this._previousNetworkStats.get(interfaceName);
             let rxRate = null;
             let txRate = null;
 
@@ -240,7 +271,7 @@ export default class NetTrackExtension extends Extension {
                 }
             }
 
-            this._previousStats.set(interfaceName, {
+            this._previousNetworkStats.set(interfaceName, {
                 rxBytes,
                 txBytes,
                 time: now,
@@ -255,9 +286,9 @@ export default class NetTrackExtension extends Extension {
             });
         }
 
-        for (const interfaceName of this._previousStats.keys()) {
+        for (const interfaceName of this._previousNetworkStats.keys()) {
             if (!currentInterfaces.has(interfaceName)) {
-                this._previousStats.delete(interfaceName);
+                this._previousNetworkStats.delete(interfaceName);
             }
         }
 
@@ -271,18 +302,18 @@ export default class NetTrackExtension extends Extension {
             : '↓ --   ↑ --';
 
         this._label.set_text(rateText);
-        this._totalItem.label.set_text(`Total  ${rateText}`);
+        this._networkTotalItem.label.set_text(`Network total  ${rateText}`);
     }
 
     _syncMenuRows(rows) {
         const visibleInterfaces = new Set(rows.map(row => row.interfaceName));
 
-        this._emptyItem.visible = rows.length === 0;
+        this._networkEmptyItem.visible = rows.length === 0;
 
-        for (const [interfaceName, item] of this._interfaceItems.entries()) {
+        for (const [interfaceName, item] of this._networkItems.entries()) {
             if (!visibleInterfaces.has(interfaceName)) {
                 item.destroy();
-                this._interfaceItems.delete(interfaceName);
+                this._networkItems.delete(interfaceName);
             }
         }
 
@@ -295,12 +326,12 @@ export default class NetTrackExtension extends Extension {
         });
 
         for (const row of rows) {
-            let item = this._interfaceItems.get(row.interfaceName);
+            let item = this._networkItems.get(row.interfaceName);
 
             if (!item) {
                 item = this._createInfoMenuItem('');
-                this._interfaceItems.set(row.interfaceName, item);
-                this._indicator.menu.addMenuItem(item);
+                this._networkItems.set(row.interfaceName, item);
+                this._networkSection.addMenuItem(item);
             }
 
             item.label.set_text(this._formatInterfaceRow(row));
@@ -381,7 +412,200 @@ export default class NetTrackExtension extends Extension {
         }
     }
 
-    _readCounter(interfaceName, counter) {
+    _updateDiskStats() {
+        const now = GLib.get_monotonic_time();
+        const devices = this._getBlockDevices();
+        const currentDevices = new Set();
+        const rows = [];
+        let totalReadRate = 0;
+        let totalWriteRate = 0;
+        let hasRate = false;
+
+        for (const deviceName of devices) {
+            const counters = this._readDiskCounters(deviceName);
+
+            if (counters === null) {
+                continue;
+            }
+
+            currentDevices.add(deviceName);
+
+            const previous = this._previousDiskStats.get(deviceName);
+            let readRate = null;
+            let writeRate = null;
+
+            if (
+                previous &&
+                counters.readBytes >= previous.readBytes &&
+                counters.writeBytes >= previous.writeBytes
+            ) {
+                const elapsedSeconds = (now - previous.time) / 1_000_000;
+
+                if (elapsedSeconds > 0) {
+                    readRate =
+                        (counters.readBytes - previous.readBytes) / elapsedSeconds;
+                    writeRate =
+                        (counters.writeBytes - previous.writeBytes) / elapsedSeconds;
+                    totalReadRate += readRate;
+                    totalWriteRate += writeRate;
+                    hasRate = true;
+                }
+            }
+
+            this._previousDiskStats.set(deviceName, {
+                readBytes: counters.readBytes,
+                writeBytes: counters.writeBytes,
+                time: now,
+            });
+
+            rows.push({
+                deviceName,
+                label: this._getDiskLabel(deviceName),
+                readRate,
+                writeRate,
+            });
+        }
+
+        for (const deviceName of this._previousDiskStats.keys()) {
+            if (!currentDevices.has(deviceName)) {
+                this._previousDiskStats.delete(deviceName);
+            }
+        }
+
+        this._setDiskRateLabels(totalReadRate, totalWriteRate, hasRate);
+        this._syncDiskRows(rows);
+    }
+
+    _getBlockDevices() {
+        const devices = [];
+        let enumerator = null;
+
+        try {
+            const directory = Gio.File.new_for_path('/sys/block');
+
+            enumerator = directory.enumerate_children(
+                'standard::name',
+                Gio.FileQueryInfoFlags.NONE,
+                null
+            );
+
+            let fileInfo;
+            while ((fileInfo = enumerator.next_file(null)) !== null) {
+                const deviceName = fileInfo.get_name();
+
+                if (this._shouldShowBlockDevice(deviceName)) {
+                    devices.push(deviceName);
+                }
+            }
+        } catch (error) {
+            console.error(`NetTrack: Error reading block devices: ${error.message}`);
+        } finally {
+            if (enumerator !== null) {
+                try {
+                    enumerator.close(null);
+                } catch (error) {
+                    console.error(`NetTrack: Error closing block device list: ${error.message}`);
+                }
+            }
+        }
+
+        return devices.sort((a, b) => a.localeCompare(b));
+    }
+
+    _shouldShowBlockDevice(deviceName) {
+        return !HIDDEN_BLOCK_DEVICE_PREFIXES.some(prefix =>
+            deviceName.startsWith(prefix)
+        );
+    }
+
+    _setDiskRateLabels(readRate, writeRate, hasRate) {
+        const rateText = hasRate
+            ? `Read ${formatRate(readRate)}   Write ${formatRate(writeRate)}`
+            : 'Read --   Write --';
+
+        this._diskTotalItem.label.set_text(`Disk total  ${rateText}`);
+    }
+
+    _syncDiskRows(rows) {
+        const visibleDevices = new Set(rows.map(row => row.deviceName));
+
+        this._diskEmptyItem.visible = rows.length === 0;
+
+        for (const [deviceName, item] of this._diskItems.entries()) {
+            if (!visibleDevices.has(deviceName)) {
+                item.destroy();
+                this._diskItems.delete(deviceName);
+            }
+        }
+
+        rows.sort((a, b) => a.deviceName.localeCompare(b.deviceName));
+
+        for (const row of rows) {
+            let item = this._diskItems.get(row.deviceName);
+
+            if (!item) {
+                item = this._createInfoMenuItem('');
+                this._diskItems.set(row.deviceName, item);
+                this._diskSection.addMenuItem(item);
+            }
+
+            item.label.set_text(this._formatDiskRow(row));
+        }
+    }
+
+    _formatDiskRow(row) {
+        const readText = row.readRate === null ? '--' : formatRate(row.readRate);
+        const writeText = row.writeRate === null ? '--' : formatRate(row.writeRate);
+
+        return `${row.label}  Read ${readText}   Write ${writeText}`;
+    }
+
+    _getDiskLabel(deviceName) {
+        const vendor =
+            this._readTextFile(`/sys/block/${deviceName}/device/vendor`) ?? '';
+        const model =
+            this._readTextFile(`/sys/block/${deviceName}/device/model`) ?? '';
+        const label = `${vendor} ${model}`.replace(/\s+/g, ' ').trim();
+
+        if (label.length > 0) {
+            return `${label} (${deviceName})`;
+        }
+
+        return deviceName;
+    }
+
+    _readDiskCounters(deviceName) {
+        const path = `/sys/block/${deviceName}/stat`;
+        const text = this._readTextFile(path);
+
+        if (text === null) {
+            // This can happen if the disk is removed between listing and reading.
+            console.warn(`NetTrack: Failed to read ${path}`);
+            return null;
+        }
+
+        const fields = text.split(/\s+/).map(value =>
+            Number.parseInt(value, 10)
+        );
+        const readSectors = fields[2];
+        const writtenSectors = fields[6];
+
+        if (
+            fields.length < 7 ||
+            !Number.isFinite(readSectors) ||
+            !Number.isFinite(writtenSectors)
+        ) {
+            console.error(`NetTrack: Invalid disk stats from ${path}: ${text}`);
+            return null;
+        }
+
+        return {
+            readBytes: readSectors * DISK_SECTOR_SIZE_BYTES,
+            writeBytes: writtenSectors * DISK_SECTOR_SIZE_BYTES,
+        };
+    }
+
+    _readNetworkCounter(interfaceName, counter) {
         const path = `/sys/class/net/${interfaceName}/statistics/${counter}`;
         const text = this._readTextFile(path);
 
